@@ -1,0 +1,6 @@
+{
+  "name": "FindMyDoc",
+  "description": "An offline, privacy-first document search engine for Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
