@@ -8,7 +8,7 @@ import android.widget.Toast
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.extraction.LocalDocumentExtractor
-import com.example.core.ocr.LocalOcrEngine
+import com.example.core.ocr.PaddleOcrEngine
 import com.example.core.search.SearchPipeline
 import com.example.core.search.SearchResult
 import com.example.data.database.DocDao
@@ -41,8 +41,7 @@ data class SettingsState(
     val enableAutoIndexing: Boolean = true,
     val enableOcr: Boolean = true,
     val enableSemanticSearch: Boolean = true,
-    val isDarkMode: Boolean? = null, // null means system preference
-    val selectedEngine: String = "gemma"
+    val isDarkMode: Boolean? = null // null means system preference
 )
 
 @OptIn(FlowPreview::class)
@@ -51,7 +50,7 @@ class MainViewModel(private val context: Context) : ViewModel() {
     private val db = DocDatabase.getDatabase(context)
     val docDao: DocDao = db.docDao()
 
-    private val ocrEngine = LocalOcrEngine()
+    private val ocrEngine = PaddleOcrEngine(context)
     private val docExtractor = LocalDocumentExtractor(context, ocrEngine)
     val embeddingEngine = com.example.core.embeddings.DynamicEmbeddingEngine(context)
 
@@ -101,14 +100,12 @@ class MainViewModel(private val context: Context) : ViewModel() {
         val ocr = prefs.getBoolean("enable_ocr", true)
         val sem = prefs.getBoolean("enable_semantic", true)
         val dark = if (prefs.contains("is_dark_mode")) prefs.getBoolean("is_dark_mode", false) else null
-        val engine = prefs.getString("selected_embedding_engine", "gemma") ?: "gemma"
-        
+
         _settingsState.value = SettingsState(
             enableAutoIndexing = autoIdx,
             enableOcr = ocr,
             enableSemanticSearch = sem,
-            isDarkMode = dark,
-            selectedEngine = engine
+            isDarkMode = dark
         )
 
         // Monitor search query changes and trigger search with debounce for efficiency
@@ -241,8 +238,35 @@ class MainViewModel(private val context: Context) : ViewModel() {
 
     // --- Document Interactions ---
     fun openDocument(context: Context, doc: DocumentEntity) {
+        // Launch the view intent immediately - opening a file must never wait on indexing work.
+        // (indexDocumentImmediately used to be awaited ahead of this and force a full re-extract,
+        // which under a concurrent background scan could take long enough that the chooser never
+        // appeared to fire at all.)
+        try {
+            val shareableUri = getShareableUri(context, doc.uri)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(shareableUri, doc.mimeType)
+                flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            context.startActivity(Intent.createChooser(intent, "Open with").apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            })
+        } catch (e: Exception) {
+            // If SAF viewer fails because it's a simulated sandbox URI, mock it with a helpful toast
+            if (doc.uri.startsWith("content://com.seekmydocs.sandbox")) {
+                Toast.makeText(
+                    context,
+                    "Opening Sandbox File: ${doc.fileName} (${doc.documentType})\nEverything runs secure, offline!",
+                    Toast.LENGTH_LONG
+                ).show()
+            } else {
+                Toast.makeText(context, "No suitable reader found for ${doc.fileName}", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         viewModelScope.launch {
-            // Priority/Lazy Indexing: index this document immediately in a non-blocking background coroutine
+            // Priority/Lazy Indexing: keep this document's index fresh, now genuinely in the
+            // background - it must never delay opening the file above.
             try {
                 indexRepository.indexDocumentImmediately(doc.uri)
             } catch (e: Exception) {
@@ -260,27 +284,6 @@ class MainViewModel(private val context: Context) : ViewModel() {
                 docDao.insertDocumentUsage(newUsage)
             } catch (e: Exception) {
                 Log.e("MainViewModel", "Error updating usage log", e)
-            }
-
-            // Launch view intent
-            try {
-                val shareableUri = getShareableUri(context, doc.uri)
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(shareableUri, doc.mimeType)
-                    flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
-                }
-                context.startActivity(intent)
-            } catch (e: Exception) {
-                // If SAF viewer fails because it's a simulated sandbox URI, mock it with a helpful toast
-                if (doc.uri.startsWith("content://com.seekmydocs.sandbox")) {
-                    Toast.makeText(
-                        context,
-                        "Opening Sandbox File: ${doc.fileName} (${doc.documentType})\nEverything runs secure, offline!",
-                        Toast.LENGTH_LONG
-                    ).show()
-                } else {
-                    Toast.makeText(context, "No suitable reader found for ${doc.fileName}", Toast.LENGTH_SHORT).show()
-                }
             }
         }
     }
@@ -339,11 +342,6 @@ class MainViewModel(private val context: Context) : ViewModel() {
         } else {
             prefs.edit().putBoolean("is_dark_mode", enabled).apply()
         }
-    }
-
-    fun updateEmbeddingEngine(engine: String) {
-        _settingsState.value = _settingsState.value.copy(selectedEngine = engine)
-        prefs.edit().putString("selected_embedding_engine", engine).apply()
     }
 
     // --- Stat computation helper ---

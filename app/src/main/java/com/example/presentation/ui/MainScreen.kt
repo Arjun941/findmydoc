@@ -1245,7 +1245,7 @@ fun SettingsTabContent(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Optical Character Recognition (OCR)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                            Text("Use ML Kit to render and extract readable texts from image-only PDFs and scanned paper docs.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("Extract readable text from image-only PDFs and scanned paper docs using on-device OCR (PaddleOCR).", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Switch(
                             checked = settings.enableOcr,
@@ -1317,7 +1317,7 @@ fun SettingsTabContent(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Active Embedding Model", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                            Text("Gemma-300M (144d - SentencePiece)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("arctic-embed-s (384d - ONNX/WordPiece)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         Text(
                             text = "Fixed Default",

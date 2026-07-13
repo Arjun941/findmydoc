@@ -7,6 +7,9 @@ import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.example.core.ocr.OcrEngine
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.zip.ZipInputStream
@@ -25,6 +28,12 @@ class LocalDocumentExtractor(
     private val context: Context,
     private val ocrEngine: OcrEngine
 ) : DocumentExtractor {
+
+    companion object {
+        // Below this, treat the "text layer" as noise (e.g. a single stray watermark text object
+        // on an otherwise scanned page) and fall back to OCR instead of indexing near-nothing.
+        private const val MIN_DIGITAL_TEXT_LENGTH = 40
+    }
 
     private val tag = "LocalDocumentExtractor"
 
@@ -166,40 +175,29 @@ class LocalDocumentExtractor(
     }
 
     /**
-     * PDF Text extraction:
-     * 1. Attempt basic PDF text parsing (checking for textual strings or utilizing PdfRenderer page info)
-     * 2. If extracted text is low/empty, render pages to Bitmaps and run OCR Engine!
+     * PDF text extraction: real text layer first, OCR only as a fallback.
+     *
+     * An earlier version tried a lightweight pass first - reading the file's raw bytes and
+     * stripping non-alphanumeric characters, on the assumption some PDFs have plain-readable text
+     * streams. That's not true for real-world PDFs: content streams are almost always compressed
+     * (FlateDecode for text, DCTDecode/JPXDecode for scanned-page images), so raw-byte reading
+     * only ever recovered the PDF container header/object syntax, never real content - it was
+     * removed entirely and every PDF went through OCR unconditionally. That was correct as a fix
+     * (no more binary noise) but wasteful for genuinely digital PDFs, which have a perfectly good
+     * text layer sitting right there.
+     *
+     * PDFBox-Android does real PDF parsing (content-stream decompression, text operators, font/
+     * ToUnicode decoding) rather than raw-byte reading, so "did it find real text" is a reliable,
+     * non-heuristic signal - a scanned/image-only PDF has no text objects at all and PDFBox
+     * correctly returns empty, it never leaks binary structure the way the old approach did.
      */
     private suspend fun extractPdfText(uri: Uri): ExtractedDocument {
-        val stringBuilder = java.lang.StringBuilder()
-        var textLengthThreshold = 30 // Minimum characters to consider a PDF text-rich
-
-        // Try standard text decoding from PDF streams (simple text streams exist in many PDFs)
-        try {
-            context.contentResolver.openInputStream(uri)?.use { inputStream ->
-                BufferedReader(InputStreamReader(inputStream)).use { reader ->
-                    var lineCount = 0
-                    var line = reader.readLine()
-                    while (line != null && lineCount < 200) { // check first few lines
-                        val textPart = line.replace(Regex("[^a-zA-Z0-9\\s]"), " ")
-                        if (textPart.trim().isNotEmpty()) {
-                            stringBuilder.append(textPart).append(" ")
-                        }
-                        line = reader.readLine()
-                        lineCount++
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "Failed standard PDF text read", e)
+        val digitalText = tryExtractDigitalPdfText(uri)
+        if (digitalText != null && digitalText.trim().length >= MIN_DIGITAL_TEXT_LENGTH) {
+            return ExtractedDocument(digitalText, mapOf("source" to "PDF Text Layer (PDFBox)"), wasOcrUsed = false)
         }
 
-        val parsedText = stringBuilder.toString().trim()
-        if (parsedText.length >= textLengthThreshold) {
-            return ExtractedDocument(parsedText, mapOf("source" to "PDF Text Decoder"))
-        }
-
-        // --- OCR Fallback Pipeline ---
+        // --- OCR fallback: no usable text layer (scanned/image-only PDF) ---
         // Render PDF pages using Android's native PdfRenderer
         val bitmaps = mutableListOf<Bitmap>()
         try {
@@ -231,7 +229,26 @@ class LocalDocumentExtractor(
             }
             ExtractedDocument(ocrResult.text, mapOf("source" to "PDF OCR Engine"), wasOcrUsed = true)
         } else {
-            ExtractedDocument(parsedText, mapOf("source" to "PDF Fallback (No Pages Rendered)"))
+            ExtractedDocument("", mapOf("source" to "PDF Fallback (No Pages Rendered)", "error" to "PdfRenderer produced no pages"))
+        }
+    }
+
+    /** Returns the PDF's real extracted text via PDFBox, or null if parsing failed outright
+     * (encrypted/corrupt file) - a genuinely scanned/image-only PDF parses fine and just yields
+     * an empty/near-empty string, which the caller's length check catches. */
+    private fun tryExtractDigitalPdfText(uri: Uri): String? {
+        if (!PDFBoxResourceLoader.isReady()) {
+            PDFBoxResourceLoader.init(context)
+        }
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                PDDocument.load(inputStream).use { document ->
+                    PDFTextStripper().getText(document)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "PDFBox text-layer extraction failed, falling back to OCR", e)
+            null
         }
     }
 

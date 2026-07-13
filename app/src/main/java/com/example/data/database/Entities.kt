@@ -69,3 +69,34 @@ data class DocumentUsageEntity(
     val openCount: Int = 0,
     val lastOpened: Long = System.currentTimeMillis()
 )
+
+/**
+ * Per-file lifecycle tracker for the indexing pipeline. A row is written for every discovered
+ * file before any processing starts, so a file can never silently disappear from the pipeline -
+ * it must end in COMMITTED or FAILED (with a reason). Carries the same fields as the pipeline's
+ * internal DocumentMetadata so a FAILED entry can be re-attempted without re-scanning the device.
+ */
+@Entity(tableName = "indexing_ledger")
+data class IndexingLedgerEntity(
+    @PrimaryKey val uri: String,
+    val fileName: String,
+    val mimeType: String,
+    val size: Long,
+    val modifiedAt: Long,
+    val hash: String,
+    val documentType: String,
+    val status: String,
+    val failedStage: String? = null,
+    val failureReason: String? = null,
+    val attemptCount: Int = 1,
+    val lastUpdatedAt: Long = System.currentTimeMillis()
+)
+
+object LedgerStatus {
+    const val DISCOVERED = "DISCOVERED"
+    const val EXTRACTED = "EXTRACTED"
+    const val CHUNKED = "CHUNKED"
+    const val EMBEDDED = "EMBEDDED"
+    const val COMMITTED = "COMMITTED"
+    const val FAILED = "FAILED"
+}

@@ -10,7 +10,6 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.example.core.extraction.LocalDocumentExtractor
-import com.example.core.ocr.LocalOcrEngine
 import com.example.data.database.DocDatabase
 import com.example.data.repository.IndexingRepository
 import java.util.concurrent.TimeUnit

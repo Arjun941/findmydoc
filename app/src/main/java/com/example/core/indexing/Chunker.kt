@@ -8,10 +8,16 @@ data class DocumentChunk(
 object Chunker {
 
     /**
-     * Splits document text into chunks of 300 to 400 tokens (estimated or counted),
-     * with overlap, aligning with paragraphs and sentences first to avoid mid-sentence cuts.
+     * Splits document text into chunks of ~100-150 tokens (estimated), with overlap, aligning
+     * with paragraphs and sentences first to avoid mid-sentence cuts.
+     *
+     * arctic-embed-s truncates any input past 512 WordPiece tokens (ArcticEmbedder reserves 2 of
+     * those for [CLS]/[SEP]) rather than failing the whole batch, but truncation still silently
+     * drops content. The words*1.3 estimate below is a rough heuristic that can undercount real
+     * subword tokenization on some content (e.g. whitespace-sparse text), so maxTokens is kept
+     * with a large margin under 512 to make truncation unlikely in normal prose.
      */
-    fun chunk(text: String, maxTokens: Int = 350, overlapTokens: Int = 45): List<DocumentChunk> {
+    fun chunk(text: String, maxTokens: Int = 150, overlapTokens: Int = 20): List<DocumentChunk> {
         if (text.isBlank()) return emptyList()
 
         val separators = listOf("\n\n", "\n", ". ", "? ", "! ", " ")

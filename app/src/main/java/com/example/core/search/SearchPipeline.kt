@@ -1,10 +1,9 @@
 package com.example.core.search
 
+import com.example.core.embeddings.EmbeddingEngine
 import com.example.data.database.DocDao
 import com.example.data.database.DocumentEntity
-import com.example.core.embeddings.EmbeddingEngine
 import java.util.Locale
-import kotlin.math.sqrt
 
 data class SearchResult(
     val document: DocumentEntity,
@@ -23,6 +22,21 @@ class SearchPipeline(
     private val embeddingEngine: EmbeddingEngine
 ) {
 
+    private val vectorIndex = VectorIndex()
+
+    @Volatile
+    private var indexedVectorCount = -1
+
+    /** Rebuilds the in-memory ANN index from Room only when the stored embedding count changed. */
+    private suspend fun ensureVectorIndex() {
+        val currentCount = docDao.getEmbeddingCount()
+        if (currentCount != indexedVectorCount) {
+            val rows = docDao.getAllChunkVectorRows()
+            vectorIndex.rebuild(rows.map { Triple(it.chunkId, it.documentId, it.vector) })
+            indexedVectorCount = currentCount
+        }
+    }
+
     suspend fun search(
         query: String,
         enableSemantic: Boolean = true,
@@ -33,33 +47,27 @@ class SearchPipeline(
         val normalizedQuery = query.trim().lowercase(Locale.ROOT)
         val queryTerms = normalizedQuery.split(Regex("[^a-zA-Z0-9]+")).filter { it.isNotBlank() }
 
-        // 1. Generate query embedding
-        val queryVector = if (enableSemantic) embeddingEngine.embed(query, isQuery = true) else null
+        // 1. Semantic candidate retrieval: ANN top-K across the whole corpus (falls back to an
+        // exact scan internally below VectorIndex's size threshold), reduced to a per-document best score.
+        val semanticBestByDoc = mutableMapOf<Long, Float>()
+        if (enableSemantic) {
+            ensureVectorIndex()
+            val queryVector = embeddingEngine.embed(query, isQuery = true)
+            for (match in vectorIndex.findNearest(queryVector, VECTOR_CANDIDATE_K)) {
+                val prevBest = semanticBestByDoc[match.documentId] ?: -1f
+                if (match.score > prevBest) semanticBestByDoc[match.documentId] = match.score
+            }
+        }
 
-        // 2. Fetch all required data from DB
+        // 2. Bulk-fetch everything else needed for fusion scoring (no N+1 per-document queries).
         val allDocuments = docDao.getAllDocumentsSync()
-        val allChunksWithEmbeddings = if (enableSemantic) docDao.getAllChunksWithEmbeddings() else emptyList()
-
-        // Fetch usage analytics
-        val allUsages = mutableMapOf<Long, Pair<Int, Long>>() // docId -> (openCount, lastOpened)
-        // Since we can query database, let's fetch usages or build custom map
-        for (doc in allDocuments) {
-            val usage = docDao.getDocumentUsage(doc.id)
-            if (usage != null) {
-                allUsages[doc.id] = Pair(usage.openCount, usage.lastOpened)
-            }
-        }
-
-        // Fetch OCR caches if needed
-        val allOcrTexts = mutableMapOf<Long, String>() // docId -> combinedOcrText
-        if (enableOcr) {
-            for (doc in allDocuments) {
-                val ocrList = docDao.getOcrForDocument(doc.id)
-                if (ocrList.isNotEmpty()) {
-                    allOcrTexts[doc.id] = ocrList.joinToString(" ") { it.text }
-                }
-            }
-        }
+        val chunksByDocument = docDao.getAllChunkTextRows().groupBy { it.documentId }
+        val usageByDoc = docDao.getAllDocumentUsagesSync().associateBy { it.documentId }
+        val ocrTextByDoc: Map<Long, String> = if (enableOcr) {
+            docDao.getAllOcrSync()
+                .groupBy { it.documentId }
+                .mapValues { (_, ocrList) -> ocrList.joinToString(" ") { it.text } }
+        } else emptyMap()
 
         val results = mutableListOf<SearchResult>()
 
@@ -72,60 +80,27 @@ class SearchPipeline(
                 // Exact phrase matches in the filename should be extremely prominent
                 filenameScore = if (fileNameLower == normalizedQuery) 400.0f else 250.0f
             } else {
-                // Check if individual query terms appear in the filename
                 var matchedTermsInFilename = 0
                 for (term in queryTerms) {
-                    if (fileNameLower.contains(term)) {
-                        matchedTermsInFilename++
-                    }
+                    if (fileNameLower.contains(term)) matchedTermsInFilename++
                 }
-                if (matchedTermsInFilename > 0) {
-                    filenameScore = matchedTermsInFilename * 50.0f
-                }
+                if (matchedTermsInFilename > 0) filenameScore = matchedTermsInFilename * 50.0f
             }
 
-            // Keyword text match score (matching text in chunks)
-            val docChunks = if (enableSemantic) {
-                allChunksWithEmbeddings.filter { it.documentId == doc.id }
-            } else {
-                docDao.getChunksForDocument(doc.id).map { chunk ->
-                    com.example.data.database.ChunkWithEmbedding(
-                        chunkId = chunk.id,
-                        documentId = chunk.documentId,
-                        text = chunk.text,
-                        order = chunk.order,
-                        vector = FloatArray(0)
-                    )
-                }
-            }
+            val docChunks = chunksByDocument[doc.id] ?: emptyList()
 
-            var bestSemanticScore = 0.0f
             var bestChunkText = ""
-            
-            // To prevent density bias where long documents gather high scores,
-            // we look for the single best matching chunk (highest density of terms)
             var bestChunkKeywordScore = 0.0f
             val matchedUniqueTermsInDoc = mutableSetOf<String>()
             var hasExactPhraseMatchInChunk = false
 
             for (chunk in docChunks) {
-                // Compute semantic similarity if query vector is available
-                if (queryVector != null && chunk.vector.isNotEmpty()) {
-                    val sim = cosineSimilarity(queryVector, chunk.vector)
-                    if (sim > bestSemanticScore) {
-                        bestSemanticScore = sim
-                        bestChunkText = chunk.text
-                    }
-                }
-
                 val chunkTextLower = chunk.text.lowercase(Locale.ROOT)
-                
-                // Track exact phrase match in a chunk
+
                 if (chunkTextLower.contains(normalizedQuery)) {
                     hasExactPhraseMatchInChunk = true
                 }
 
-                // Keyword hits in chunk
                 var hits = 0
                 for (term in queryTerms) {
                     if (chunkTextLower.contains(term)) {
@@ -133,78 +108,72 @@ class SearchPipeline(
                         matchedUniqueTermsInDoc.add(term)
                     }
                 }
-                
+
                 if (hits > 0) {
                     val chunkKeywordScore = hits * 35.0f
                     if (chunkKeywordScore > bestChunkKeywordScore) {
                         bestChunkKeywordScore = chunkKeywordScore
-                        if (bestChunkText.isEmpty()) {
-                            bestChunkText = chunk.text
-                        }
+                        bestChunkText = chunk.text
                     }
                 }
             }
 
-            // Keyword score consists of:
-            // 1. Score from the single best matching chunk
-            // 2. Exact phrase bonus
-            // 3. Document-wide unique term matching bonus (rewards finding more search terms)
+            val bestSemanticScore = semanticBestByDoc[doc.id] ?: 0.0f
+            if (bestChunkText.isEmpty() && bestSemanticScore > 0f) {
+                // No keyword-scoring chunk was found, but this doc surfaced via semantic search;
+                // the ANN index doesn't track which chunk matched, so snippet from the first chunk.
+                bestChunkText = docChunks.firstOrNull()?.text ?: ""
+            }
+
             var keywordScore = bestChunkKeywordScore
             if (hasExactPhraseMatchInChunk) {
                 keywordScore += 150.0f
             }
             keywordScore += matchedUniqueTermsInDoc.size * 20.0f
 
-            // OCR matches
-            val ocrText = allOcrTexts[doc.id] ?: ""
+            val ocrText = ocrTextByDoc[doc.id] ?: ""
             val ocrTextLower = ocrText.lowercase(Locale.ROOT)
             val isOcrMatch = ocrTextLower.contains(normalizedQuery)
-            var ocrScore = 0.0f
-            
-            if (isOcrMatch) {
-                ocrScore = 120.0f // exact phrase in OCR
+            val ocrScore = if (isOcrMatch) {
+                120.0f
             } else {
                 var ocrHits = 0
                 for (term in queryTerms) {
-                    if (ocrTextLower.contains(term)) {
-                        ocrHits++
-                    }
+                    if (ocrTextLower.contains(term)) ocrHits++
                 }
-                ocrScore = minOf(ocrHits * 20.0f, 80.0f)
+                minOf(ocrHits * 20.0f, 80.0f)
             }
 
-            // Popularity & Recency score (Should act as subtle tie-breakers, NOT override accurate keyword/semantic matches)
-            val (openCount, lastOpened) = allUsages[doc.id] ?: Pair(0, 0L)
+            val usage = usageByDoc[doc.id]
+            val openCount = usage?.openCount ?: 0
+            val lastOpened = usage?.lastOpened ?: 0L
             val popularityScore = minOf(openCount * 4.0f, 30.0f)
 
-            // Recency score (days since modified)
             val ageMs = System.currentTimeMillis() - doc.modifiedAt
             val ageDays = (ageMs / (1000 * 60 * 60 * 24)).coerceAtLeast(0)
             val recencyScore = if (ageDays < 7) 15.0f else if (ageDays < 30) 7.0f else 0.0f
 
-            // Combined Score Calculation
-            // Scale semantic score (usually between 0.3 and 0.8)
+            // Combined Score Calculation.
+            // arctic-embed-s cosines (query-prefixed vs. unprefixed chunks) empirically cluster
+            // ~0.60-0.71 for relevant pairs and ~0.29-0.48 for unrelated ones - see the gate
+            // constants below for the calibration this was derived from.
             var semanticWeight = 0.0f
-            if (bestSemanticScore > 0.35f) {
+            if (bestSemanticScore > SEMANTIC_WEIGHT_GATE) {
                 semanticWeight = bestSemanticScore * 180.0f
-                // Add confidence-graded neural boosts for highly accurate conceptual matches
-                if (bestSemanticScore > 0.50f) {
+                if (bestSemanticScore > SEMANTIC_HIGH_GATE) {
                     semanticWeight += 80.0f
                 }
-                if (bestSemanticScore > 0.65f) {
+                if (bestSemanticScore > SEMANTIC_VERY_HIGH_GATE) {
                     semanticWeight += 120.0f
                 }
             }
 
             val finalScore = filenameScore + keywordScore + ocrScore + semanticWeight + popularityScore + recencyScore
 
-            // Generate Match Snippet
             val snippet = generateSnippet(bestChunkText.ifEmpty { ocrText.ifEmpty { doc.fileName } }, queryTerms)
 
-            // Only include in search results if there is clear relevance:
-            // Either a keyword match, a filename match, an OCR match, or a reasonable semantic similarity
             val hasDirectMatch = isFilenameMatch || matchedUniqueTermsInDoc.isNotEmpty() || isOcrMatch || ocrScore > 0.0f
-            val hasHighSemanticSimilarity = bestSemanticScore > 0.38f
+            val hasHighSemanticSimilarity = bestSemanticScore > SEMANTIC_MATCH_GATE
 
             if (hasDirectMatch || hasHighSemanticSimilarity) {
                 results.add(
@@ -213,7 +182,7 @@ class SearchPipeline(
                         score = finalScore,
                         snippet = snippet,
                         matchedQueryTerms = queryTerms,
-                        isSemanticMatch = bestSemanticScore > 0.42f,
+                        isSemanticMatch = bestSemanticScore > SEMANTIC_LABEL_GATE,
                         isFilenameMatch = isFilenameMatch,
                         isOcrMatch = isOcrMatch || ocrScore > 0.0f,
                         openCount = openCount,
@@ -223,33 +192,13 @@ class SearchPipeline(
             }
         }
 
-        // Sort by final score descending
         return results.sortedByDescending { it.score }
-    }
-
-    private fun cosineSimilarity(vecA: FloatArray, vecB: FloatArray): Float {
-        if (vecA.size != vecB.size || vecA.isEmpty()) return 0.0f
-        var dotProduct = 0.0f
-        var normA = 0.0f
-        var normB = 0.0f
-        for (i in vecA.indices) {
-            dotProduct += vecA[i] * vecB[i]
-            normA += vecA[i] * vecA[i]
-            normB += vecB[i] * vecB[i]
-        }
-        val denom = sqrt(normA) * sqrt(normB)
-        return if (denom > 1e-6) (dotProduct / denom).getOrElseAndFallback(0.0f) else 0.0f
-    }
-
-    private fun Float.getOrElseAndFallback(fallback: Float): Float {
-        return if (this.isNaN() || this.isInfinite()) fallback else this
     }
 
     private fun generateSnippet(text: String, queryTerms: List<String>): String {
         if (text.isBlank()) return ""
         val lowercaseText = text.lowercase(Locale.ROOT)
 
-        // Find the index of the first matching query term
         var matchIndex = -1
         for (term in queryTerms) {
             val idx = lowercaseText.indexOf(term)
@@ -260,11 +209,9 @@ class SearchPipeline(
         }
 
         if (matchIndex == -1) {
-            // Return first 120 characters
             return if (text.length > 120) text.substring(0, 117) + "..." else text
         }
 
-        // Frame a window around the match
         val start = (matchIndex - 50).coerceAtLeast(0)
         val end = (matchIndex + 100).coerceAtMost(text.length)
 
@@ -276,5 +223,24 @@ class SearchPipeline(
             snippet = snippet + "..."
         }
         return snippet
+    }
+
+    companion object {
+        // ANN candidate pool: generously larger than expected chunk counts for a personal document
+        // corpus, so a document's single best-matching chunk is very unlikely to be excluded.
+        private const val VECTOR_CANDIDATE_K = 200
+
+        // Recalibrated for arctic-embed-s (previous values were tuned for EmbeddingGemma's score
+        // distribution, which doesn't transfer - different model, different embedding space).
+        // Derived from a small labeled set (5 relevant / 6 irrelevant query-chunk pairs drawn from
+        // this corpus's actual content) run through the real model+tokenizer on the JVM:
+        // relevant scores ranged 0.60-0.71 (avg 0.65), irrelevant ranged 0.29-0.48 (avg 0.42) -
+        // a clean +0.12 gap between the relevant floor and irrelevant ceiling. Gates below sit with
+        // margin around that boundary rather than hugging it, since the calibration set is small.
+        private const val SEMANTIC_WEIGHT_GATE = 0.48f
+        private const val SEMANTIC_MATCH_GATE = 0.52f
+        private const val SEMANTIC_LABEL_GATE = 0.52f
+        private const val SEMANTIC_HIGH_GATE = 0.60f
+        private const val SEMANTIC_VERY_HIGH_GATE = 0.66f
     }
 }

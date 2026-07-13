@@ -11,9 +11,12 @@ import com.example.data.database.DocDao
 import com.example.data.database.DocumentEntity
 import com.example.data.database.EmbeddingEntity
 import com.example.data.database.OcrEntity
+import com.example.data.database.IndexingLedgerEntity
+import com.example.data.database.LedgerStatus
 import com.example.core.embeddings.EmbeddingEngine
+import com.example.core.embeddings.ArcticEmbedder
 import com.example.core.extraction.LocalDocumentExtractor
-import com.example.core.ocr.LocalOcrEngine
+import com.example.core.ocr.PaddleOcrEngine
 import com.example.data.database.DocDatabase
 import android.os.Environment
 import kotlinx.coroutines.Dispatchers
@@ -66,26 +69,6 @@ class IndexingRepository(
                 throw SecurityException("Read/Write Storage Permission is not granted. Please allow storage access first.")
             }
 
-            if (!embeddingEngine.isModelDownloaded()) {
-                _indexingProgress.value = IndexingProgress("Downloading Model (0%)")
-                try {
-                    val success = embeddingEngine.downloadModelAndVocab { status, progress ->
-                        _indexingProgress.value = IndexingProgress(
-                            status = status,
-                            totalFiles = 0,
-                            processedFiles = 0,
-                            currentFileName = "Gemma Model"
-                        )
-                    }
-                    if (!success) {
-                        Log.e(tag, "Failed to download Gemma Embedding Model. Continuing without semantic search.")
-                    }
-                } catch (e: Exception) {
-                    // Semantic search is an optional enhancement — a model download/init
-                    // failure must not block filename/keyword/OCR-based scanning and indexing.
-                    Log.e(tag, "Embedding model unavailable. Continuing without semantic search.", e)
-                }
-            }
             _indexingProgress.value = IndexingProgress("Scanning")
             val discoveredFiles = mutableListOf<DocumentMetadata>()
 
@@ -225,6 +208,36 @@ class IndexingRepository(
         val isSkip: Boolean
     )
 
+    private fun ledgerEntityFor(
+        metadata: DocumentMetadata,
+        status: String,
+        failedStage: String? = null,
+        failureReason: String? = null,
+        attemptCount: Int = 1
+    ) = IndexingLedgerEntity(
+        uri = metadata.uri,
+        fileName = metadata.fileName,
+        mimeType = metadata.mimeType,
+        size = metadata.size,
+        modifiedAt = metadata.modifiedAt,
+        hash = metadata.hash,
+        documentType = metadata.documentType,
+        status = status,
+        failedStage = failedStage,
+        failureReason = failureReason,
+        attemptCount = attemptCount
+    )
+
+    private suspend fun writeLedger(
+        metadata: DocumentMetadata,
+        status: String,
+        failedStage: String? = null,
+        failureReason: String? = null,
+        attemptCount: Int = 1
+    ) {
+        docDao.upsertLedgerEntry(ledgerEntityFor(metadata, status, failedStage, failureReason, attemptCount))
+    }
+
     private suspend fun processDiscoveryList(discovered: List<DocumentMetadata>, forceRescan: Boolean) = withContext(Dispatchers.Default) {
         val total = discovered.size
         if (total == 0) {
@@ -234,18 +247,38 @@ class IndexingRepository(
 
         _indexingProgress.value = IndexingProgress("Processing", totalFiles = total, processedFiles = 0)
 
+        // Part 2 requirement: every discovered file gets a ledger row up front, before any
+        // processing begins, so a file can never silently disappear from the pipeline - it must
+        // end this run in COMMITTED or FAILED (with a reason).
+        withContext(Dispatchers.IO) {
+            docDao.upsertLedgerEntries(discovered.map { ledgerEntityFor(it, LedgerStatus.DISCOVERED) })
+        }
+
         // Channel for passing prepared docs from parser/chunker thread pool to the embedder/writer
         val preparedChannel = Channel<PreparedDoc>(capacity = 10)
 
-        // Spawn a coroutine for embedding generation & database insertion (consumer)
-        val consumerJob = launch(Dispatchers.IO) {
-            var processedCount = 0
+        // Embedding inference is CPU-bound; a small pool of independent ONNX Runtime sessions -
+        // each with its own session/arena - lets several documents embed concurrently instead of
+        // serializing through one. Kept modest (not = core count) since the device was already
+        // under real memory pressure (multi-GB swap in use) even before adding more sessions.
+        val embedWorkerCount = 3
+        val embedEngines = List(embedWorkerCount) { index ->
+            if (index == 0) embeddingEngine else ArcticEmbedder(context)
+        }
+        val processedCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+        // Spawn a pool of coroutines for embedding generation & database insertion (consumers).
+        // Channel consumption fans out automatically: each PreparedDoc is delivered to exactly one
+        // worker, so N workers embedding different documents run truly in parallel.
+        val consumerJobs = List(embedWorkerCount) { workerIndex ->
+            val workerEngine = embedEngines[workerIndex]
+            launch(Dispatchers.IO) {
             for (prepared in preparedChannel) {
                 try {
                     _indexingProgress.value = IndexingProgress(
                         status = "Processing",
                         totalFiles = total,
-                        processedFiles = processedCount,
+                        processedFiles = processedCount.get(),
                         currentFileName = prepared.metadata.fileName
                     )
 
@@ -275,16 +308,16 @@ class IndexingRepository(
                         
                         if (uniqueTextsList.isNotEmpty()) {
                             // Run batch embedding inference!
-                            val vectors = embeddingEngine.embedBatch(uniqueTextsList)
-                            val expectedDim = if (embeddingEngine.modelDirName.contains("gemma")) 144 else 384
+                            val vectors = workerEngine.embedBatch(uniqueTextsList)
                             for (i in uniqueTextsList.indices) {
-                                uniqueTextsMap[uniqueTextsList[i]] = vectors.getOrElse(i) { FloatArray(expectedDim) }
+                                uniqueTextsMap[uniqueTextsList[i]] = vectors.getOrElse(i) { FloatArray(ArcticEmbedder.EMBEDDING_DIM) }
                             }
                         }
+                        writeLedger(prepared.metadata, LedgerStatus.EMBEDDED)
 
                         val embeddingEntities = chunkIds.mapIndexed { index, chunkId ->
                             val chunkText = prepared.chunkTexts[index]
-                            val vector = uniqueTextsMap[chunkText] ?: FloatArray(if (embeddingEngine.modelDirName.contains("gemma")) 144 else 384)
+                            val vector = uniqueTextsMap[chunkText] ?: FloatArray(ArcticEmbedder.EMBEDDING_DIM)
                             EmbeddingEntity(
                                 chunkId = chunkId,
                                 vector = vector
@@ -293,29 +326,37 @@ class IndexingRepository(
 
                         docDao.insertEmbeddings(embeddingEntities)
                         docDao.insertDocument(prepared.newDocEntity.copy(
-                            id = prepared.docId, 
-                            ocrCompleted = prepared.wasOcrUsed, 
+                            id = prepared.docId,
+                            ocrCompleted = prepared.wasOcrUsed,
                             embeddingCompleted = true
                         ))
+                        writeLedger(prepared.metadata, LedgerStatus.COMMITTED)
                     } else {
                         // Mark completed even if empty chunks
                         docDao.insertDocument(prepared.newDocEntity.copy(
-                            id = prepared.docId, 
-                            ocrCompleted = prepared.wasOcrUsed, 
+                            id = prepared.docId,
+                            ocrCompleted = prepared.wasOcrUsed,
                             embeddingCompleted = true
                         ))
+                        writeLedger(prepared.metadata, LedgerStatus.COMMITTED)
                     }
                 } catch (e: Exception) {
                     Log.e(tag, "Failed to consumer-embed doc ${prepared.metadata.fileName}", e)
+                    writeLedger(
+                        prepared.metadata, LedgerStatus.FAILED,
+                        failedStage = "EMBED_OR_COMMIT",
+                        failureReason = e.message ?: e.toString()
+                    )
                 } finally {
-                    processedCount++
+                    val done = processedCount.incrementAndGet()
                     _indexingProgress.value = IndexingProgress(
                         status = "Processing",
                         totalFiles = total,
-                        processedFiles = processedCount,
+                        processedFiles = done,
                         currentFileName = prepared.metadata.fileName
                     )
                 }
+            }
             }
         }
 
@@ -344,12 +385,39 @@ class IndexingRepository(
                                 extractedText = "",
                                 isSkip = true
                             ))
+                            writeLedger(metadata, LedgerStatus.COMMITTED)
                             continue
                         }
 
                         // If file changed or re-indexing forced, clear existing document indices first
                         if (existingDoc != null) {
                             withContext(Dispatchers.IO) { deleteDocumentIndexSync(existingDoc.id) }
+                        }
+
+                        // Duplicate-content shortcut: many real-world corpora carry the same file
+                        // in multiple places (Downloads + WhatsApp Media + backups). If a
+                        // byte-identical copy has already been fully embedded elsewhere, clone its
+                        // chunks/embeddings instead of re-running extraction (incl. OCR) and
+                        // inference for content we've already processed.
+                        val duplicateSource = withContext(Dispatchers.IO) {
+                            docDao.getCompletedDocumentByHash(metadata.hash)
+                        }
+                        if (duplicateSource != null) {
+                            val cloned = withContext(Dispatchers.IO) {
+                                cloneIndexedDocument(duplicateSource, metadata)
+                            }
+                            preparedChannel.send(PreparedDoc(
+                                metadata = metadata,
+                                newDocEntity = cloned,
+                                docId = cloned.id,
+                                chunks = emptyList(),
+                                chunkTexts = emptyList(),
+                                wasOcrUsed = cloned.ocrCompleted,
+                                extractedText = "",
+                                isSkip = true
+                            ))
+                            writeLedger(metadata, LedgerStatus.COMMITTED)
+                            continue
                         }
 
                         // Create new document entity
@@ -370,10 +438,12 @@ class IndexingRepository(
 
                         // 2. Extract Text (highly parallel CPU-bound task across workers)
                         val extracted = documentExtractor.extract(Uri.parse(metadata.uri))
+                        writeLedger(metadata, LedgerStatus.EXTRACTED)
 
                         // 3. Chunk Text
                         val chunks = Chunker.chunk(extracted.text)
-                        
+                        writeLedger(metadata, LedgerStatus.CHUNKED)
+
                         val chunkEntities = chunks.map { chunk ->
                             // Cache tokenizer output separately from embeddings (Requirement 8)
                             val tokenIdsList = try {
@@ -404,6 +474,11 @@ class IndexingRepository(
 
                     } catch (e: Exception) {
                         Log.e(tag, "Failed to parse document ${metadata.fileName} in worker", e)
+                        writeLedger(
+                            metadata, LedgerStatus.FAILED,
+                            failedStage = "EXTRACT_OR_CHUNK",
+                            failureReason = e.message ?: e.toString()
+                        )
                         // Send dummy skip task to consumer so the progress bar increments correctly
                         preparedChannel.send(PreparedDoc(
                             metadata = metadata,
@@ -424,10 +499,101 @@ class IndexingRepository(
         producerJobs.forEach { it.join() }
         preparedChannel.close()
 
-        // Wait for the consumer to finish embedding and saving to DB
-        consumerJob.join()
+        // Wait for all embedding consumer workers to finish
+        consumerJobs.forEach { it.join() }
+
+        // Part 2 requirement: retry any file that didn't reach COMMITTED once, in case the
+        // failure was transient (e.g. a memory spike under load). Sequential, not parallel -
+        // this is a small cleanup pass over what should be a minority of files, and running it
+        // sequentially avoids re-creating the same contention that may have caused the failure.
+        val uncommitted = withContext(Dispatchers.IO) { docDao.getUncommittedLedgerEntries() }
+        if (uncommitted.isNotEmpty()) {
+            Log.d(tag, "Retry pass: ${uncommitted.size} file(s) not yet committed")
+            for (entry in uncommitted) {
+                retryLedgerEntry(entry)
+            }
+        }
 
         _indexingProgress.value = IndexingProgress("Completed", totalFiles = total, processedFiles = total)
+    }
+
+    /**
+     * Re-attempts the full extract -> chunk -> embed -> commit sequence for a single file that
+     * didn't reach COMMITTED in the main run. Sequential and self-contained (no channels/worker
+     * pool) since this only runs over the presumably-small set of files that failed once.
+     */
+    private suspend fun retryLedgerEntry(entry: IndexingLedgerEntity) = withContext(Dispatchers.IO) {
+        val metadata = DocumentMetadata(
+            uri = entry.uri,
+            fileName = entry.fileName,
+            mimeType = entry.mimeType,
+            size = entry.size,
+            modifiedAt = entry.modifiedAt,
+            hash = entry.hash,
+            documentType = entry.documentType
+        )
+        val nextAttempt = entry.attemptCount + 1
+        try {
+            val existingDoc = docDao.getDocumentByUri(metadata.uri)
+            if (existingDoc != null) {
+                deleteDocumentIndexSync(existingDoc.id)
+            }
+
+            val freshEntity = DocumentEntity(
+                uri = metadata.uri,
+                fileName = metadata.fileName,
+                mimeType = metadata.mimeType,
+                size = metadata.size,
+                modifiedAt = metadata.modifiedAt,
+                indexedAt = System.currentTimeMillis(),
+                hash = metadata.hash,
+                documentType = metadata.documentType,
+                ocrCompleted = false,
+                embeddingCompleted = false
+            )
+            val docId = docDao.insertDocument(freshEntity)
+
+            val extracted = documentExtractor.extract(Uri.parse(metadata.uri))
+            writeLedger(metadata, LedgerStatus.EXTRACTED, attemptCount = nextAttempt)
+
+            val chunks = Chunker.chunk(extracted.text)
+            val chunkEntities = chunks.map { chunk ->
+                ChunkEntity(documentId = docId, text = chunk.text, order = chunk.order)
+            }
+            writeLedger(metadata, LedgerStatus.CHUNKED, attemptCount = nextAttempt)
+
+            if (extracted.wasOcrUsed) {
+                docDao.insertOcr(OcrEntity(documentId = docId, pageNumber = 1, text = extracted.text, confidence = 0.92f))
+            }
+
+            if (chunkEntities.isNotEmpty()) {
+                val chunkIds = docDao.insertChunks(chunkEntities)
+                val uniqueTexts = chunks.map { it.text }.distinct()
+                val vectors = embeddingEngine.embedBatch(uniqueTexts)
+                val vectorByText = uniqueTexts.zip(vectors).toMap()
+                writeLedger(metadata, LedgerStatus.EMBEDDED, attemptCount = nextAttempt)
+
+                val embeddingEntities = chunkIds.mapIndexed { index, chunkId ->
+                    val text = chunks[index].text
+                    EmbeddingEntity(chunkId = chunkId, vector = vectorByText[text] ?: FloatArray(ArcticEmbedder.EMBEDDING_DIM))
+                }
+                docDao.insertEmbeddings(embeddingEntities)
+            }
+
+            docDao.insertDocument(
+                freshEntity.copy(id = docId, ocrCompleted = extracted.wasOcrUsed, embeddingCompleted = true)
+            )
+            writeLedger(metadata, LedgerStatus.COMMITTED, attemptCount = nextAttempt)
+            Log.d(tag, "Retry succeeded for ${metadata.fileName}")
+        } catch (e: Exception) {
+            Log.e(tag, "Retry failed for ${entry.fileName}", e)
+            writeLedger(
+                metadata, LedgerStatus.FAILED,
+                failedStage = "RETRY",
+                failureReason = e.message ?: e.toString(),
+                attemptCount = nextAttempt
+            )
+        }
     }
 
     /**
@@ -530,26 +696,6 @@ class IndexingRepository(
                 throw SecurityException("Read/Write Storage Permission is not granted. Please allow storage access first.")
             }
 
-            if (!embeddingEngine.isModelDownloaded()) {
-                _indexingProgress.value = IndexingProgress("Downloading Model (0%)")
-                try {
-                    val success = embeddingEngine.downloadModelAndVocab { status, progress ->
-                        _indexingProgress.value = IndexingProgress(
-                            status = status,
-                            totalFiles = 0,
-                            processedFiles = 0,
-                            currentFileName = "Gemma Model"
-                        )
-                    }
-                    if (!success) {
-                        Log.e(tag, "Failed to download Gemma Embedding Model. Continuing without semantic search.")
-                    }
-                } catch (e: Exception) {
-                    // Semantic search is an optional enhancement — a model download/init
-                    // failure must not block filename/keyword/OCR-based scanning and indexing.
-                    Log.e(tag, "Embedding model unavailable. Continuing without semantic search.", e)
-                }
-            }
             _indexingProgress.value = IndexingProgress("Scanning")
         val sandboxDocuments = listOf(
             DocumentSandboxTemplate(
@@ -670,6 +816,45 @@ class IndexingRepository(
         }
     }
 
+    /**
+     * Copies an already-embedded document's chunks/embeddings/OCR onto a new document row for a
+     * different URI with byte-identical content, so duplicate files skip re-extraction and
+     * re-inference entirely.
+     */
+    private suspend fun cloneIndexedDocument(source: DocumentEntity, metadata: DocumentMetadata): DocumentEntity {
+        val newDocEntity = DocumentEntity(
+            uri = metadata.uri,
+            fileName = metadata.fileName,
+            mimeType = metadata.mimeType,
+            size = metadata.size,
+            modifiedAt = metadata.modifiedAt,
+            indexedAt = System.currentTimeMillis(),
+            hash = metadata.hash,
+            documentType = metadata.documentType,
+            ocrCompleted = source.ocrCompleted,
+            embeddingCompleted = true
+        )
+        val newDocId = docDao.insertDocument(newDocEntity)
+
+        val sourceChunks = docDao.getChunksWithEmbeddingsForDocument(source.id)
+        if (sourceChunks.isNotEmpty()) {
+            val newChunkIds = docDao.insertChunks(sourceChunks.map { chunk ->
+                ChunkEntity(documentId = newDocId, text = chunk.text, order = chunk.order)
+            })
+            val newEmbeddings = newChunkIds.mapIndexed { index, chunkId ->
+                EmbeddingEntity(chunkId = chunkId, vector = sourceChunks[index].vector)
+            }
+            docDao.insertEmbeddings(newEmbeddings)
+        }
+
+        if (source.ocrCompleted) {
+            val sourceOcr = docDao.getOcrForDocument(source.id)
+            docDao.insertOcrs(sourceOcr.map { it.copy(id = 0, documentId = newDocId) })
+        }
+
+        return newDocEntity.copy(id = newDocId)
+    }
+
     private suspend fun deleteDocumentIndexSync(docId: Long) {
         docDao.deleteEmbeddingsByDocumentId(docId)
         docDao.deleteChunksByDocumentId(docId)
@@ -686,6 +871,7 @@ class IndexingRepository(
         docDao.deleteAllChunks()
         docDao.deleteAllOcrCache()
         docDao.deleteAllDocuments()
+        docDao.deleteAllLedgerEntries()
     }
 
     private fun scanDirectoryRecursively(directory: File, discoveredFiles: MutableList<DocumentMetadata>) {
@@ -799,7 +985,7 @@ class IndexingRepository(
                     val appContext = context.applicationContext
                     val db = DocDatabase.getDatabase(appContext)
                     val docDao = db.docDao()
-                    val ocrEngine = LocalOcrEngine()
+                    val ocrEngine = PaddleOcrEngine(appContext)
                     val docExtractor = LocalDocumentExtractor(appContext, ocrEngine)
                     val embeddingEngine = com.example.core.embeddings.DynamicEmbeddingEngine(appContext)
                     IndexingRepository(appContext, docDao, docExtractor, embeddingEngine)

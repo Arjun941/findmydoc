@@ -13,3 +13,6 @@ local.properties
 debug.keystore
 .claude
 *.log
+scratchpad/
+*.jks
+.release-keystore-credentials.txt

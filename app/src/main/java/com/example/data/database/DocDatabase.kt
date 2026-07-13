@@ -13,9 +13,10 @@ import androidx.room.TypeConverters
         EmbeddingEntity::class,
         OcrEntity::class,
         SearchHistoryEntity::class,
-        DocumentUsageEntity::class
+        DocumentUsageEntity::class,
+        IndexingLedgerEntity::class
     ],
-    version = 2,
+    version = 4,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
