@@ -96,12 +96,7 @@ Release builds are signed using a keystore referenced by environment variables i
 - `STORE_PASSWORD`
 - `KEY_PASSWORD`
 
-Supply your own keystore and credentials before building a release APK/AAB — none are committed to the repository.
-
-## Known Limitations
-
-- **Test coverage is thin outside the vector index**: `VectorIndexTest` and `LocalDocumentExtractorTest` cover the ANN index and the digital-text-vs-OCR extraction path; the rest of the indexing/search pipeline is only manually verified.
-- No CI configuration is currently included in the repository.
+Supply your own keystore and credentials before building a release APK/AAB — none are committed to the repository
 
 ## License
 
