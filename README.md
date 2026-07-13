@@ -1,32 +1,49 @@
-# SeekMyDocs
+<div align="center">
+  <img src=".github/assets/banner.svg" alt="SeekMyDocs" width="100%">
+
+  <p></p>
+
+  [![License: GPL v3](https://img.shields.io/github/license/Arjun941/seekmydocs?color=blue)](LICENSE)
+  [![Latest release](https://img.shields.io/github/v/release/Arjun941/seekmydocs?include_prereleases&label=release&color=8e6ff0)](https://github.com/Arjun941/seekmydocs/releases)
+  [![Downloads](https://img.shields.io/github/downloads/Arjun941/seekmydocs/total?color=d0bcff)](https://github.com/Arjun941/seekmydocs/releases)
+  [![Kotlin](https://img.shields.io/badge/Kotlin-2.2-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org)
+  [![Platform](https://img.shields.io/badge/Platform-Android%207.0%2B-3DDC84?logo=android&logoColor=white)](https://developer.android.com)
+  [![Compose](https://img.shields.io/badge/UI-Jetpack%20Compose-4285F4?logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
+</div>
+
+---
 
 **SeekMyDocs** is an offline, privacy-first document search engine for Android. It indexes documents already on your device — PDFs, Office files, text, and more — and lets you find them instantly with filename, keyword, OCR, or on-device semantic search. No document content, embedding, or query ever leaves the device, and no network access is used at all.
 
-> Built with Kotlin, Jetpack Compose, and on-device ML (ONNX Runtime).
-
 ## Features
 
-- **Automatic background indexing** of documents on external storage (Downloads, Documents, MediaStore) via WorkManager, running every ~4 hours under battery/idle constraints
-- **Real-time re-indexing** while the app is open, using a `ContentObserver` on the MediaStore
-- **Incremental indexing** — files are re-indexed only when their name/size/modified-time hash changes, and byte-identical duplicate files reuse an existing document's embeddings instead of re-processing
-- **Hybrid search** combining:
+- 🔄 **Automatic background indexing** of documents on external storage (Downloads, Documents, MediaStore) via WorkManager, running every ~4 hours under battery/idle constraints
+- ⚡ **Real-time re-indexing** while the app is open, using a `ContentObserver` on the MediaStore
+- 🧩 **Incremental indexing** — files are re-indexed only when their name/size/modified-time hash changes, and byte-identical duplicate files reuse an existing document's embeddings instead of re-processing
+- 🔍 **Hybrid search** combining:
   - Filename matching
   - Keyword / full-text search over extracted content
   - OCR text search (for scanned PDFs/images)
   - On-device semantic (vector) search over chunk embeddings, retrieved via an in-process HNSW approximate-nearest-neighbor index (exact brute-force search below a small corpus size)
-- **Ranked results** using a weighted score combining relevance, recency, and how often a document has been opened
-- **Sandbox/demo mode** that generates sample documents (resume, bill, timetable, etc.) so search can be tried without real files
-- **Open/share documents** directly from search results via a `FileProvider`
-- **Dashboard** showing indexing stats: documents indexed, chunks, embeddings generated, OCR pages cached, storage used, last sync time
-- **Settings** to toggle auto-indexing, OCR, semantic search, and dark mode
+- 📈 **Ranked results** using a weighted score combining relevance, recency, and how often a document has been opened
+- 🧪 **Sandbox/demo mode** that generates sample documents (resume, bill, timetable, etc.) so search can be tried without real files
+- 📤 **Open/share documents** directly from search results via a `FileProvider`
+- 📊 **Dashboard** showing indexing stats: documents indexed, chunks, embeddings generated, OCR pages cached, storage used, last sync time
+- ⚙️ **Settings** to toggle auto-indexing, OCR, semantic search, and dark mode
 
 ### Supported document formats
 
-PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX, TXT, CSV, MD, JSON, XML, EPUB, ODT/ODS/ODP
+<div align="center">
+
+`PDF` `DOC` `DOCX` `XLS` `XLSX` `PPT` `PPTX` `TXT` `CSV` `MD` `JSON` `XML` `EPUB` `ODT` `ODS` `ODP`
+
+</div>
 
 For PDFs, the real embedded text layer is extracted directly (via PDFBox) whenever one exists — OCR only runs as a fallback for image-only/scanned PDFs with no usable text layer. All other formats are parsed procedurally (ZIP/XML for Office & OpenDocument formats, plain text otherwise) and never go through OCR.
 
-## Tech Stack
+## Architecture
+
+SeekMyDocs is a single-module Android app: Kotlin + Jetpack Compose on top of an MVVM architecture (`ViewModel` + `StateFlow` driving the Compose UI), Room for local persistence, and WorkManager for background indexing. Every ML component — embeddings, OCR, and the vector index — runs fully on-device.
 
 | Layer | Technology |
 |---|---|
@@ -41,7 +58,7 @@ For PDFs, the real embedded text layer is extracted directly (via PDFBox) whenev
 | PDF/text extraction | PDFBox-Android (real text layer), custom ZIP/XML parsing for Office & OpenDocument formats |
 | Testing | JUnit, Robolectric, Espresso, Roborazzi (screenshot tests) |
 
-## Project Structure
+### Project structure
 
 ```
 app/src/main/java/com/example/
@@ -59,6 +76,20 @@ app/src/main/java/com/example/
 │   ├── MainViewModel.kt
 │   └── ui/           # Compose screens
 └── ui/theme/         # Compose theming
+```
+
+### Indexing pipeline
+
+```mermaid
+flowchart LR
+    A[MediaStore / directory scan] --> B[Extract text\nPDFBox / ZIP-XML]
+    B -->|no text layer| C[OCR\nPaddleOCR PP-OCRv4]
+    B -->|has text layer| D[Chunk]
+    C --> D
+    D --> E[Embed\narctic-embed-s / ONNX]
+    E --> F[Room\nBLOB vectors]
+    F --> G[HNSW index]
+    G --> H[Search results]
 ```
 
 ## Getting Started
@@ -88,6 +119,10 @@ Everything the app needs (embedding model, tokenizer, OCR models) ships inside t
 The app requests:
 - `READ_EXTERNAL_STORAGE` / `MANAGE_EXTERNAL_STORAGE` — to scan documents across device storage
 
+### Prebuilt APKs
+
+Prebuilt, signed APKs (per-architecture and universal) are published on the [Releases page](https://github.com/Arjun941/seekmydocs/releases) — no build step required if you just want to try the app.
+
 ## Building a Release
 
 Release builds are signed using a keystore referenced by environment variables in `app/build.gradle.kts`:
@@ -96,8 +131,14 @@ Release builds are signed using a keystore referenced by environment variables i
 - `STORE_PASSWORD`
 - `KEY_PASSWORD`
 
-Supply your own keystore and credentials before building a release APK/AAB — none are committed to the repository
+Supply your own keystore and credentials before building a release APK/AAB — none are committed to the repository. The app is built with per-ABI splits (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`) plus a universal APK.
 
 ## License
 
-GNU GPLv3 — see [LICENSE](LICENSE).
+<div align="center">
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
+</div>
+
+Licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for the full text.

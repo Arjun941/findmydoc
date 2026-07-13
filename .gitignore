@@ -16,3 +16,4 @@ debug.keystore
 scratchpad/
 *.jks
 .release-keystore-credentials.txt
+release-assets/
