@@ -94,12 +94,7 @@ Release builds are signed using a keystore referenced by environment variables i
 - `STORE_PASSWORD`
 - `KEY_PASSWORD`
 
-Supply your own keystore and credentials before building a release APK/AAB — none are committed to the repository.
-
-## Known Limitations
-
-- **OCR is currently stubbed**: `LocalOcrEngine` returns simulated placeholder text rather than performing real text recognition.
-- No CI configuration or LICENSE file is currently included in the repository.
+Supply your own keystore and credentials before building a release APK/AAB — none are committed to the repository
 
 ## License
 
